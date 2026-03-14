@@ -38,6 +38,7 @@ Key Features:
 from __future__ import annotations
 import json
 import enum
+import os
 from dataclasses import fields, is_dataclass, dataclass, field
 from typing import Any, cast, get_args, get_origin
 from dataclasses import MISSING
@@ -174,6 +175,193 @@ class Config:
                     parts.append(f"{f.name}={value}")
 
         return f"{self.__class__.__name__}({', '.join(parts)})"
+
+    def _collect_defines(self, prefix: str = "CONFIG",
+                         section_path: list[str] | None = None,
+                         depth: int = 0) -> list[dict]:
+        """
+        Recursively collect C preprocessor defines from this config tree.
+
+        Walks all dataclass fields. Leaf values (int, bool, str, float, enum) produce a
+        ``#define``.  Nested ``Config`` subclasses and lists of ``Config`` are recursed into.
+        Fields inherited from the ``Config`` base (parent, name, path) are skipped.
+
+        Args:
+            prefix: Underscore-separated prefix for the define name
+                    (e.g. ``"CONFIG"`` → ``CONFIG_FREQUENCY``).
+            section_path: Hierarchical path of section names for readability.
+            depth: Current nesting depth.
+
+        Returns:
+            List of entries.  Each entry is either:
+            - A leaf: ``{"kind": "define", "name": str, "value": str, "desc": str}``
+            - A section: ``{"kind": "section", "label": str, "depth": int,
+              "children": list[dict]}``
+        """
+        if section_path is None:
+            section_path = []
+
+        _base_names = {"parent", "name", "path"}
+        leaves: list[dict] = []
+        sections: list[dict] = []
+
+        for f in fields(self):
+            if f.name in _base_names:
+                continue
+
+            value = getattr(self, f.name, None)
+            if value is None:
+                continue
+
+            define_name = f"{prefix}_{f.name.upper()}"
+            desc = f.metadata.get("description", "") if f.metadata else ""
+            fmt = f.metadata.get("format") if f.metadata else None
+            label = f.name.upper().replace("_", " ")
+
+            # Nested Config → recurse into a section
+            if isinstance(value, Config):
+                children = value._collect_defines(
+                    define_name, section_path + [label], depth + 1)
+                if children:
+                    sections.append({
+                        "kind": "section",
+                        "label": " / ".join(section_path + [label]),
+                        "depth": depth + 1,
+                        "children": children,
+                    })
+                continue
+
+            # List of Configs → recurse with index
+            if isinstance(value, (list, tuple)):
+                all_config = all(isinstance(v, Config) for v in value)
+                if all_config and len(value) > 0:
+                    list_children: list[dict] = []
+                    list_children.append({
+                        "kind": "define",
+                        "name": f"{define_name}_COUNT",
+                        "value": str(len(value)),
+                        "desc": f"Number of {f.name}",
+                    })
+                    for i, item in enumerate(value):
+                        item_label = f"{label} {i}"
+                        item_children = item._collect_defines(
+                            f"{define_name}_{i}", section_path + [item_label], depth + 1)
+                        if item_children:
+                            list_children.append({
+                                "kind": "section",
+                                "label": " / ".join(section_path + [item_label]),
+                                "depth": depth + 1,
+                                "children": item_children,
+                            })
+                    sections.append({
+                        "kind": "section",
+                        "label": " / ".join(section_path + [label]),
+                        "depth": depth + 1,
+                        "children": list_children,
+                    })
+                    continue
+
+            # Leaf value → format
+            if isinstance(value, bool):
+                c_value = "1" if value else "0"
+            elif isinstance(value, int):
+                if fmt == "hex":
+                    c_value = f"0x{value:08x}"
+                else:
+                    c_value = str(value)
+            elif isinstance(value, float):
+                c_value = str(value)
+            elif isinstance(value, str):
+                c_value = f'"{value}"'
+            elif isinstance(value, enum.Enum):
+                v = value.value
+                if isinstance(v, int):
+                    c_value = str(v)
+                else:
+                    c_value = f'"{v}"'
+            else:
+                continue
+
+            leaves.append({
+                "kind": "define",
+                "name": define_name,
+                "value": c_value,
+                "desc": desc,
+            })
+
+        # Leaves first (direct fields of this level), then nested sections
+        return leaves + sections
+
+    def generate_header(self, path: str, prefix: str = "CONFIG",
+                        guard: str | None = None) -> None:
+        """
+        Generate a C header file with ``#define`` directives from this config tree.
+
+        The header contains an include guard and one ``#define`` per leaf field, with
+        optional comments taken from the field description.  Nested Config objects are
+        rendered as labeled sections for readability.
+
+        Args:
+            path:   Output file path.  Parent directories are created automatically.
+            prefix: Prefix for all define names (default ``"CONFIG"``).
+            guard:  Include-guard macro name.  If *None*, one is derived from *path*.
+        """
+        tree = self._collect_defines(prefix)
+
+        if guard is None:
+            guard = "_" + os.path.basename(path).upper().replace(".", "_").replace("-", "_") + "_"
+
+        # Collect all define names to compute alignment
+        all_defines: list[dict] = []
+        def _gather(entries: list[dict]) -> None:
+            for e in entries:
+                if e["kind"] == "define":
+                    all_defines.append(e)
+                elif e["kind"] == "section":
+                    _gather(e["children"])
+        _gather(tree)
+
+        max_name_len = max((len(d["name"]) for d in all_defines), default=0)
+
+        lines: list[str] = []
+        lines.append(f"#ifndef {guard}")
+        lines.append(f"#define {guard}")
+        lines.append("")
+        lines.append("/* Auto-generated from GVSoC Config tree — do not edit */")
+
+        def _render(entries: list[dict], depth: int) -> None:
+            for e in entries:
+                if e["kind"] == "section":
+                    label = e["label"]
+                    d = e["depth"]
+                    lines.append("")
+                    if d <= 1:
+                        # Top-level section: prominent banner
+                        banner_len = max(len(label) + 6, 40)
+                        lines.append("/* " + "=" * banner_len + " */")
+                        padding_total = banner_len - len(label)
+                        left = padding_total // 2
+                        right = padding_total - left
+                        lines.append("/* " + " " * left + label + " " * right + " */")
+                        lines.append("/* " + "=" * banner_len + " */")
+                    else:
+                        # Deeper section: lighter separator
+                        lines.append("/* " + "-" * 4 + " " + label + " " + "-" * 4 + " */")
+                    _render(e["children"], depth + 1)
+                elif e["kind"] == "define":
+                    padding = " " * (max_name_len - len(e["name"]) + 2)
+                    lines.append(f"#define {e['name']}{padding}{e['value']}")
+
+        _render(tree, 0)
+
+        lines.append("")
+        lines.append(f"#endif /* {guard} */")
+        lines.append("")
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines))
 
 def cfg_field(
     *,
